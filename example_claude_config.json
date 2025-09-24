@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "hexstrike-ai": {
+      "command": "D:\\hexstrike-ai\\hexstrike-ai\\.venv\\Scripts\\python.exe",
+      "args": [
+        "D:\\hexstrike-ai\\cloned\\hexstrike-ai\\hexstrike_mcp.py"
+      ],
+      "description": "HexStrike AI v6.0 - Advanced Cybersecurity Automation Platform",
+      "timeout": 600,
+      "disabled": false,
+      "cwd": "D:\\hexstrike-ai\\cloned\\hexstrike-ai",
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

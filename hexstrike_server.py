@@ -24,6 +24,8 @@ import logging
 import os
 import subprocess
 import sys
+import io
+import tempfile
 import traceback
 import threading
 import time
@@ -69,25 +71,106 @@ from mitmproxy.options import Options as MitmOptions
 # LOGGING CONFIGURATION (MUST BE FIRST)
 # ============================================================================
 
-# Configure logging with fallback for permission issues
+# Configure logging with UTF-8 console output so emojis don't raise on Windows
 try:
+    # Ensure sys.stdout/stderr use UTF-8 in this process (helps threads and libraries)
+    try:
+        # Python 3.7+ supports reconfigure
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        # Fallback: wrap buffers where needed; individual handlers will also be wrapped
+        pass
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Safe StreamHandler that falls back to writing UTF-8 bytes to the underlying buffer
+    class SafeStreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            try:
+                super().emit(record)
+            except UnicodeEncodeError:
+                try:
+                    msg = self.format(record) + self.terminator
+                    stream = getattr(self, 'stream', sys.stdout)
+                    buf = getattr(stream, 'buffer', None)
+                    if buf is not None:
+                        try:
+                            buf.write(msg.encode('utf-8', 'replace'))
+                            buf.flush()
+                        except Exception:
+                            # final fallback: write to original stream
+                            stream.write(msg)
+                            try:
+                                stream.flush()
+                            except Exception:
+                                pass
+                    else:
+                        stream.write(msg)
+                        try:
+                            stream.flush()
+                        except Exception:
+                            pass
+                except Exception:
+                    self.handleError(record)
+
+    # Do NOT monkeypatch logging.StreamHandler globally; we'll install our own handler explicitly
+
+    # Wrap stdout in a UTF-8 TextIOWrapper that replaces unencodable characters
+    utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    stream_handler = SafeStreamHandler(utf8_stdout)
+    stream_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+    # Try to add file handler; if permission denied, continue with console only
+    handlers = [stream_handler]
+    try:
+        file_handler = logging.FileHandler('hexstrike.log')
+        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        handlers.append(file_handler)
+    except PermissionError:
+        pass
+
+    # Atomically replace all handlers with our UTF-8 safe ones
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler('hexstrike.log')
-        ]
+        handlers=handlers,
+        force=True,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
-except PermissionError:
-    # Fallback to console-only logging if file creation fails
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
+
+    # Replace any lingering StreamHandlers on named loggers with SafeStreamHandler
+    try:
+        def _replace_handlers_on_logger(lgr: logging.Logger):
+            new_handlers = []
+            for h in lgr.handlers:
+                if isinstance(h, logging.StreamHandler) and not isinstance(h, SafeStreamHandler):
+                    stream = getattr(h, 'stream', sys.stdout)
+                    try:
+                        stream = io.TextIOWrapper(stream.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+                    except Exception:
+                        pass
+                    sh = SafeStreamHandler(stream)
+                    sh.setLevel(h.level)
+                    sh.setFormatter(h.formatter)
+                    new_handlers.append(sh)
+                else:
+                    new_handlers.append(h)
+            lgr.handlers = new_handlers
+
+        _replace_handlers_on_logger(root_logger)
+
+        for name, obj in logging.root.manager.loggerDict.items():
+            if isinstance(obj, logging.Logger):
+                _replace_handlers_on_logger(obj)
+
+        # Ensure lastResort also uses SafeStreamHandler
+        logging.lastResort = SafeStreamHandler(sys.stderr)
+    except Exception:
+        pass
+except Exception:
+    # Fallback to basic config if anything unexpected happens
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
 logger = logging.getLogger(__name__)
 
 # Flask app configuration
@@ -5705,9 +5788,27 @@ class ProcessManager:
 class PythonEnvironmentManager:
     """Manage Python virtual environments and dependencies"""
 
-    def __init__(self, base_dir: str = "/tmp/hexstrike_envs"):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
+    def __init__(self, base_dir: Optional[str] = None):
+        # Allow overriding the envs dir via HEXSTRIKE_ENVS_DIR
+        if base_dir:
+            base = Path(base_dir)
+        else:
+            # Use system temp dir to avoid Unix-style '/tmp' UNC issues on Windows
+            base = Path(tempfile.gettempdir())
+
+        # Ensure folder name is 'hexstrike_envs'
+        if base.name != 'hexstrike_envs':
+            self.base_dir = base / 'hexstrike_envs'
+        else:
+            self.base_dir = base
+
+        # Normalize and create parents if needed
+        self.base_dir = self.base_dir.expanduser()
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.exception('Failed to create environment base dir %s: %s', self.base_dir, e)
+            raise
 
     def create_venv(self, env_name: str) -> Path:
         """Create a new virtual environment"""
@@ -6649,8 +6750,12 @@ def setup_logging():
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
 
-    # Console handler with colors
-    console_handler = logging.StreamHandler(sys.stdout)
+    # Console handler with colors - ensure UTF-8 output on Windows consoles
+    try:
+        utf8_stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+        console_handler = SafeStreamHandler(utf8_stdout)
+    except Exception:
+        console_handler = SafeStreamHandler(sys.stdout)
     console_handler.setFormatter(ColoredFormatter(
         "[🔥 HexStrike AI] %(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
@@ -8928,9 +9033,24 @@ def _determine_operation_type(tool_name: str) -> str:
 class FileOperationsManager:
     """Handle file operations with security and validation"""
 
-    def __init__(self, base_dir: str = "/tmp/hexstrike_files"):
-        self.base_dir = Path(base_dir)
-        self.base_dir.mkdir(exist_ok=True)
+    def __init__(self, base_dir: Optional[str] = None):
+        # Use override if provided; otherwise place under system temp dir
+        if base_dir:
+            base = Path(base_dir)
+        else:
+            base = Path(tempfile.gettempdir())
+
+        if base.name != 'hexstrike_files':
+            self.base_dir = base / 'hexstrike_files'
+        else:
+            self.base_dir = base
+
+        self.base_dir = self.base_dir.expanduser()
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.exception('Failed to create file base dir %s: %s', self.base_dir, e)
+            raise
         self.max_file_size = 100 * 1024 * 1024  # 100MB
 
     def create_file(self, filename: str, content: str, binary: bool = False) -> Dict[str, Any]:
